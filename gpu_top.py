@@ -1,4 +1,21 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-3.0-or-later
+#
+# gpu-top — a terminal GPU monitor powered by nvidia-smi and rich
+# Copyright (C) 2026  Chuck
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <https://www.gnu.org/licenses/>.
 """gpu-top — a terminal GPU monitor powered by nvidia-smi and rich."""
 
 import argparse
@@ -8,11 +25,10 @@ import sys
 import threading
 import time
 from collections import deque
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Dict, List, Optional
 
 from rich import box
-from rich.columns import Columns
 from rich.console import Console, Group
 from rich.live import Live
 from rich.panel import Panel
@@ -179,13 +195,24 @@ def _collect_loop(state: State, stop: threading.Event):
         t0 = time.monotonic()
         results = [None, None]
 
-        def _g(): results[0] = query_gpus()
-        def _p(): results[1] = query_procs()
+        def _g():
+            try:
+                results[0] = query_gpus()
+            except Exception:
+                pass  # results[0] stays None → collector marks state stale
+
+        def _p():
+            try:
+                results[1] = query_procs()
+            except Exception:
+                pass
 
         t1 = threading.Thread(target=_g, daemon=True)
         t2 = threading.Thread(target=_p, daemon=True)
-        t1.start(); t2.start()
-        t1.join(); t2.join()
+        t1.start()
+        t2.start()
+        t1.join()
+        t2.join()
 
         with state.lock:
             if results[0] is not None:
@@ -197,7 +224,7 @@ def _collect_loop(state: State, stop: threading.Event):
                         state.history[g.index] = deque(maxlen=HISTORY_LEN)
                     mem_pct = (
                         g.mem_used / g.mem_total * 100
-                        if g.mem_used is not None and g.mem_total
+                        if g.mem_used is not None and g.mem_total is not None and g.mem_total > 0
                         else None
                     )
                     state.history[g.index].append(HistorySample(
@@ -209,9 +236,10 @@ def _collect_loop(state: State, stop: threading.Event):
             else:
                 state.stale = True
             state.tick += 1
+            interval = state.poll_interval   # read under lock to avoid data race
 
         elapsed = time.monotonic() - t0
-        remaining = state.poll_interval - elapsed
+        remaining = interval - elapsed
         if remaining > 0:
             stop.wait(remaining)
 
@@ -245,16 +273,22 @@ def make_bar(value: Optional[float], total: float, width: int, color: str,
 
 
 def _util_color(pct: Optional[float]) -> str:
-    if pct is None: return "white"
-    if pct < 60:    return "bright_green"
-    if pct < 85:    return "yellow"
+    if pct is None:
+        return "white"
+    if pct < 60:
+        return "bright_green"
+    if pct < 85:
+        return "yellow"
     return "bright_red"
 
 
 def _temp_color(t: Optional[float]) -> str:
-    if t is None:  return "white"
-    if t < 60:     return "bright_green"
-    if t < 80:     return "yellow"
+    if t is None:
+        return "white"
+    if t < 60:
+        return "bright_green"
+    if t < 80:
+        return "yellow"
     return "bright_red"
 
 
@@ -262,8 +296,10 @@ def _power_color(draw: Optional[float], limit: Optional[float]) -> str:
     if draw is None or limit is None or limit == 0:
         return "bright_blue"
     ratio = draw / limit
-    if ratio < 0.6:  return "bright_blue"
-    if ratio < 0.85: return "yellow"
+    if ratio < 0.6:
+        return "bright_blue"
+    if ratio < 0.85:
+        return "yellow"
     return "bright_red"
 
 
@@ -399,7 +435,6 @@ def build_gpu_panel(g: GPUInfo, bar_width: int) -> Panel:
 
     # ── Memory usage ───────────────────────────────────────────────────────────
     mem_pct = (g.mem_used / g.mem_total * 100) if (g.mem_used and g.mem_total) else None
-    mem_col = _util_color(mem_pct)
     lines.append("  MEM Used  ", style="bold white")
     lines.append(make_bar(g.mem_used, g.mem_total or 1, bar_width, "cyan"))
     lines.append(f"  {_fmt(mem_pct, '.0f', '%'):>5}", style="bold cyan")
@@ -499,10 +534,14 @@ def build_header(gpus: List[GPUInfo], stale: bool, poll_interval: float) -> Pane
 
 def build_footer() -> Panel:
     t = Text()
-    t.append("  [q]", style="bold yellow"); t.append(" quit", style="dim")
-    t.append("   [+]", style="bold yellow"); t.append(" slower poll", style="dim")
-    t.append("   [-]", style="bold yellow"); t.append(" faster poll", style="dim")
-    t.append("   [Ctrl-C]", style="bold yellow"); t.append(" exit  ", style="dim")
+    t.append("  [q]", style="bold yellow")
+    t.append(" quit", style="dim")
+    t.append("   [+]", style="bold yellow")
+    t.append(" slower poll", style="dim")
+    t.append("   [-]", style="bold yellow")
+    t.append(" faster poll", style="dim")
+    t.append("   [Ctrl-C]", style="bold yellow")
+    t.append(" exit  ", style="dim")
     return Panel(t, box=box.ROUNDED, border_style="dim", padding=(0, 0))
 
 
@@ -523,7 +562,8 @@ def build_renderable(gpus, procs, history, stale, poll_interval, bar_width, cons
 # ── Key input (raw/cbreak mode) ────────────────────────────────────────────────
 
 try:
-    import termios, tty as _tty
+    import termios
+    import tty as _tty
     _HAS_TERMIOS = True
 except ImportError:
     _HAS_TERMIOS = False
