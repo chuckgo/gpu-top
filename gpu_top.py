@@ -7,8 +7,9 @@ import subprocess
 import sys
 import threading
 import time
-from dataclasses import dataclass
-from typing import List, Optional
+from collections import deque
+from dataclasses import dataclass, field
+from typing import Dict, List, Optional
 
 from rich import box
 from rich.columns import Columns
@@ -146,18 +147,29 @@ def query_procs() -> List[ProcInfo]:
 
 # ── Collector thread ───────────────────────────────────────────────────────────
 
+HISTORY_LEN = 120  # samples retained (2 min at 1 s poll)
+
+
+@dataclass
+class HistorySample:
+    util_gpu: Optional[float]   # 0–100 %
+    power_w: Optional[float]    # watts
+
+
 class State:
     def __init__(self, poll_interval: float):
         self.lock = threading.Lock()
         self.gpus: List[GPUInfo] = []
         self.procs: List[ProcInfo] = []
+        self.history: Dict[int, deque] = {}   # gpu_index → deque[HistorySample]
         self.tick: int = 0
         self.stale: bool = False
         self.poll_interval: float = poll_interval
 
     def snapshot(self):
         with self.lock:
-            return list(self.gpus), list(self.procs), self.tick, self.stale, self.poll_interval
+            hist = {k: list(v) for k, v in self.history.items()}
+            return list(self.gpus), list(self.procs), hist, self.tick, self.stale, self.poll_interval
 
 
 def _collect_loop(state: State, stop: threading.Event):
@@ -178,6 +190,12 @@ def _collect_loop(state: State, stop: threading.Event):
                 state.gpus = results[0]
                 state.procs = results[1] or []
                 state.stale = False
+                for g in state.gpus:
+                    if g.index not in state.history:
+                        state.history[g.index] = deque(maxlen=HISTORY_LEN)
+                    state.history[g.index].append(
+                        HistorySample(util_gpu=g.util_gpu, power_w=g.power_draw)
+                    )
             else:
                 state.stale = True
             state.tick += 1
@@ -241,6 +259,113 @@ def _power_color(draw: Optional[float], limit: Optional[float]) -> str:
 
 def _fmt(val: Optional[float], spec: str = ".0f", unit: str = "") -> str:
     return "---" if val is None else f"{val:{spec}}{unit}"
+
+
+# ── Sparkline / history graph ──────────────────────────────────────────────────
+
+# 9 vertical fill levels (space = 0, █ = full)
+_VBLOCKS = " ▁▂▃▄▅▆▇█"
+
+
+def _sparkline_rows(values: List[Optional[float]], width: int,
+                    max_val: float, color: str, rows: int = 4) -> List[Text]:
+    """
+    Build `rows` lines of Text that together form a vertically-stacked
+    block-character sparkline.  values[-width:] are used; fewer samples
+    are left-padded with dim filler.
+    """
+    samples = list(values)[-width:]
+    pad = width - len(samples)
+
+    row_texts = []
+    for row_idx in range(rows):           # row 0 = top, row rows-1 = bottom
+        rt = Text(no_wrap=True, overflow="ignore")
+        # left-pad with filler if not enough history yet
+        rt.append("░" * pad, style="grey19 dim")
+        for val in samples:
+            if val is None or max_val <= 0:
+                rt.append("░", style="grey19 dim")
+                continue
+            pct = max(0.0, min(1.0, val / max_val))
+            # fraction of total height covered by this row's band
+            band_lo = (rows - 1 - row_idx) / rows
+            band_hi = (rows - row_idx) / rows
+            if pct >= band_hi:
+                rt.append("█", style=f"bold {color}")
+            elif pct > band_lo:
+                frac = (pct - band_lo) * rows   # 0.0–1.0 within band
+                idx = max(1, min(8, int(frac * 8 + 0.5)))
+                rt.append(_VBLOCKS[idx], style=color)
+            else:
+                rt.append("░", style="grey19 dim")
+        row_texts.append(rt)
+    return row_texts
+
+
+def _append_graph(body: Text, label: str, values: List[Optional[float]],
+                  max_val: float, color: str, unit: str,
+                  graph_w: int, rows: int = 4) -> None:
+    """Append a labeled sparkline section into an existing Text object."""
+    spark = _sparkline_rows(values, graph_w, max_val, color, rows)
+    max_str = f"{max_val:.0f}{unit}"
+
+    # ── header: "  label ──…── max_str" fits exactly in graph_w + 2 cols ──────
+    # cols: 2("  ") + len(label) + 1(" ") + dash_len + 1(" ") + len(max_str)
+    dash_len = max(0, graph_w - len(label) - len(max_str) - 2)
+    body.append(f"  {label} ", style="bold white")
+    body.append("─" * dash_len, style="dim")
+    body.append(f" {max_str}", style=f"dim {color}")
+    body.append("\n")
+
+    # ── sparkline rows ─────────────────────────────────────────────────────────
+    for row in spark:
+        body.append("  ")
+        body.append_text(row)
+        body.append("\n")
+
+    # ── footer: time span on left, 0 on right ─────────────────────────────────
+    zero_str = f"0{unit}"
+    body.append("  ", style="")
+    body.append("─" * (graph_w - len(zero_str)), style="dim")
+    body.append(zero_str, style=f"dim {color}")
+    body.append("\n")
+
+
+def build_history_panel(g: GPUInfo, history: List[HistorySample],
+                        console_width: int) -> Panel:
+    # graph fills panel interior: width - 2 (borders) - 2 (padding each side)
+    graph_w = max(10, console_width - 6)
+
+    util_vals  = [s.util_gpu for s in history]
+    power_vals = [s.power_w  for s in history]
+    max_power  = g.power_limit or max((v for v in power_vals if v is not None), default=100.0)
+
+    body = Text(no_wrap=True, overflow="ignore")
+    _append_graph(body, "GPU Util", util_vals,  100.0,     "bright_green", "%", graph_w)
+    body.append("\n")
+    _append_graph(body, "Power",    power_vals, max_power, "bright_blue",  "W", graph_w)
+
+    # time-span legend: "  ← Ns ago ───────────────── now →"
+    n = len(history)
+    span_lbl = f"← {n}s ago" if n < 60 else f"← {n//60}m{n%60:02d}s ago"
+    now_lbl  = "now →"
+    mid_dashes = max(0, graph_w - len(span_lbl) - len(now_lbl) - 2)
+    body.append(f"\n  {span_lbl} ", style="dim")
+    body.append("─" * mid_dashes, style="dim")
+    body.append(f" {now_lbl}", style="dim")
+
+    title = Text()
+    title.append(f"  GPU {g.index}  ", style="bold bright_white on dark_green")
+    title.append(f" {g.name} — History ", style="bold bright_green")
+
+    return Panel(
+        body,
+        title=title,
+        title_align="left",
+        border_style="dark_green",
+        box=box.ROUNDED,
+        padding=(0, 1),
+    )
 
 
 # ── GPU panel ──────────────────────────────────────────────────────────────────
@@ -366,10 +491,13 @@ def build_footer() -> Panel:
 
 # ── Full renderable ────────────────────────────────────────────────────────────
 
-def build_renderable(gpus, procs, stale, poll_interval, bar_width):
+def build_renderable(gpus, procs, history, stale, poll_interval, bar_width, console_width):
     parts = [build_header(gpus, stale, poll_interval)]
     for g in gpus:
         parts.append(build_gpu_panel(g, bar_width))
+        gpu_hist = history.get(g.index, [])
+        if gpu_hist:
+            parts.append(build_history_panel(g, gpu_hist, console_width))
     parts.append(build_proc_panel(gpus, procs))
     parts.append(build_footer())
     return Group(*parts)
@@ -456,8 +584,11 @@ def main():
                     with state.lock:
                         state.poll_interval = max(state.poll_interval - 0.5, 0.5)
 
-                gpus, procs, tick, stale, poll_interval = state.snapshot()
-                live.update(build_renderable(gpus, procs, stale, poll_interval, args.bar_width))
+                gpus, procs, hist, tick, stale, poll_interval = state.snapshot()
+                live.update(build_renderable(
+                    gpus, procs, hist, stale, poll_interval,
+                    args.bar_width, console.width,
+                ))
                 time.sleep(0.05)   # 20 fps key-check; rich auto-refreshes at 8 fps
 
     except KeyboardInterrupt:
