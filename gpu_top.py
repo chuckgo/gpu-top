@@ -19,6 +19,7 @@
 """gpu-top — a terminal GPU monitor powered by nvidia-smi and rich."""
 
 import argparse
+import json
 import select
 import subprocess
 import sys
@@ -83,6 +84,15 @@ class ProcInfo:
     pid: int = 0
     name: str = "?"
     mem_used: Optional[float] = None
+
+
+@dataclass
+class CPUInfo:
+    util_pct: Optional[float] = None     # 0–100 %
+    mem_used_mb: Optional[float] = None
+    mem_total_mb: Optional[float] = None
+    temp: Optional[float] = None         # °C, package-level preferred
+    fan_rpm: Optional[float] = None      # highest fan seen (RPM)
 
 
 # ── nvidia-smi queries ─────────────────────────────────────────────────────────
@@ -161,6 +171,109 @@ def query_procs() -> List[ProcInfo]:
     return procs
 
 
+# ── CPU queries ────────────────────────────────────────────────────────────────
+
+def _read_proc_stat() -> Optional[List[int]]:
+    """Return raw CPU time counters from /proc/stat (first 'cpu' line)."""
+    try:
+        with open("/proc/stat", encoding="ascii") as f:
+            line = f.readline()
+        parts = line.split()
+        if parts[0] != "cpu":
+            return None
+        return [int(x) for x in parts[1:]]
+    except Exception:
+        return None
+
+
+def _read_meminfo() -> tuple:
+    """Return (used_mb, total_mb) from /proc/meminfo, or (None, None)."""
+    try:
+        info: Dict[str, int] = {}
+        with open("/proc/meminfo", encoding="ascii") as f:
+            for line in f:
+                k, _, v = line.partition(":")
+                try:
+                    info[k.strip()] = int(v.split()[0])
+                except (ValueError, IndexError):
+                    pass
+        total_kb = info.get("MemTotal")
+        avail_kb = info.get("MemAvailable")
+        if total_kb is None or avail_kb is None:
+            return None, None
+        return (total_kb - avail_kb) / 1024, total_kb / 1024
+    except Exception:
+        return None, None
+
+
+def _read_sensors() -> tuple:
+    """
+    Run 'sensors -j' (lm-sensors) and return (temp_c, fan_rpm).
+    Prefers package/die-level temperatures; falls back to the first
+    temperature found.  fan_rpm is the highest fan speed seen.
+    Returns (None, None) if sensors is not installed or produces no data.
+    """
+    raw = _run(["sensors", "-j"])
+    if not raw:
+        return None, None
+    try:
+        data = json.loads(raw)
+    except Exception:
+        return None, None
+
+    pkg_temp: Optional[float] = None
+    any_temp: Optional[float] = None
+    max_fan: Optional[float] = None
+
+    for chip in data.values():
+        if not isinstance(chip, dict):
+            continue
+        for feat_name, feat in chip.items():
+            if not isinstance(feat, dict):
+                continue
+            feat_lower = feat_name.lower()
+            for key, val in feat.items():
+                if not isinstance(val, (int, float)) or "input" not in key:
+                    continue
+                if "temp" in key and val > 0:
+                    if any(s in feat_lower for s in ("package", "tdie", "tctl", "physical")):
+                        pkg_temp = val
+                    elif any_temp is None:
+                        any_temp = val
+                if "fan" in key and val > 0:
+                    if max_fan is None or val > max_fan:
+                        max_fan = val
+
+    return (pkg_temp if pkg_temp is not None else any_temp), max_fan
+
+
+def query_cpu(prev_times: Optional[List[int]]) -> tuple:
+    """
+    Return (CPUInfo, current_cpu_times).
+    Pass current_cpu_times back on the next call to get CPU utilisation %.
+    On the first call (prev_times=None) util_pct will be None.
+    """
+    curr_times = _read_proc_stat()
+    util_pct: Optional[float] = None
+    if curr_times is not None and prev_times is not None and len(curr_times) >= 4:
+        delta = [c - p for c, p in zip(curr_times, prev_times)]
+        idle = delta[3] + (delta[4] if len(delta) > 4 else 0)  # idle + iowait
+        total = sum(delta)
+        if total > 0:
+            util_pct = max(0.0, min(100.0, (total - idle) / total * 100))
+
+    mem_used_mb, mem_total_mb = _read_meminfo()
+    temp, fan_rpm = _read_sensors()
+
+    return CPUInfo(
+        util_pct=util_pct,
+        mem_used_mb=mem_used_mb,
+        mem_total_mb=mem_total_mb,
+        temp=temp,
+        fan_rpm=fan_rpm,
+    ), curr_times
+
+
 # ── Collector thread ───────────────────────────────────────────────────────────
 
 HISTORY_LEN = 120  # samples retained (2 min at 1 s poll)
@@ -180,6 +293,8 @@ class State:
         self.gpus: List[GPUInfo] = []
         self.procs: List[ProcInfo] = []
         self.history: Dict[int, deque] = {}   # gpu_index → deque[HistorySample]
+        self.cpu: Optional[CPUInfo] = None
+        self._cpu_prev_times: Optional[List[int]] = None
         self.tick: int = 0
         self.stale: bool = False
         self.poll_interval: float = poll_interval
@@ -187,13 +302,16 @@ class State:
     def snapshot(self):
         with self.lock:
             hist = {k: list(v) for k, v in self.history.items()}
-            return list(self.gpus), list(self.procs), hist, self.tick, self.stale, self.poll_interval
+            return list(self.gpus), list(self.procs), hist, self.cpu, self.tick, self.stale, self.poll_interval
 
 
 def _collect_loop(state: State, stop: threading.Event):
     while not stop.is_set():
         t0 = time.monotonic()
-        results = [None, None]
+        results = [None, None, None]
+
+        with state.lock:
+            prev_cpu_times = state._cpu_prev_times
 
         def _g():
             try:
@@ -207,12 +325,21 @@ def _collect_loop(state: State, stop: threading.Event):
             except Exception:
                 pass
 
+        def _c():
+            try:
+                results[2] = query_cpu(prev_cpu_times)
+            except Exception:
+                pass
+
         t1 = threading.Thread(target=_g, daemon=True)
         t2 = threading.Thread(target=_p, daemon=True)
+        t3 = threading.Thread(target=_c, daemon=True)
         t1.start()
         t2.start()
+        t3.start()
         t1.join()
         t2.join()
+        t3.join()
 
         with state.lock:
             if results[0] is not None:
@@ -235,6 +362,8 @@ def _collect_loop(state: State, stop: threading.Event):
                     ))
             else:
                 state.stale = True
+            if results[2] is not None:
+                state.cpu, state._cpu_prev_times = results[2]
             state.tick += 1
             interval = state.poll_interval   # read under lock to avoid data race
 
@@ -421,6 +550,59 @@ def build_history_panel(g: GPUInfo, history: List[HistorySample],
     )
 
 
+# ── CPU panel ──────────────────────────────────────────────────────────────────
+
+def build_cpu_panel(cpu: CPUInfo, bar_width: int) -> Panel:
+    lines = Text(no_wrap=True, overflow="ignore")
+
+    # ── CPU utilization ────────────────────────────────────────────────────────
+    cpu_col = _util_color(cpu.util_pct)
+    lines.append("  CPU Util  ", style="bold white")
+    lines.append(make_bar(cpu.util_pct, 100, bar_width, cpu_col))
+    lines.append(f"  {_fmt(cpu.util_pct, '.0f', '%'):>5}", style=f"bold {cpu_col}")
+    lines.append("\n")
+
+    # ── Memory usage ───────────────────────────────────────────────────────────
+    mem_pct = (
+        cpu.mem_used_mb / cpu.mem_total_mb * 100
+        if cpu.mem_used_mb is not None and cpu.mem_total_mb is not None and cpu.mem_total_mb > 0
+        else None
+    )
+    lines.append("  MEM Used  ", style="bold white")
+    lines.append(make_bar(cpu.mem_used_mb, cpu.mem_total_mb or 1, bar_width, "cyan"))
+    lines.append(f"  {_fmt(mem_pct, '.0f', '%'):>5}", style="bold cyan")
+    if cpu.mem_used_mb is not None and cpu.mem_total_mb is not None:
+        lines.append(
+            f"  {cpu.mem_used_mb / 1024:.1f} / {cpu.mem_total_mb / 1024:.1f} GiB",
+            style="dim cyan",
+        )
+    lines.append("\n")
+
+    # ── Temperature and fan (omit section entirely if both unavailable) ────────
+    if cpu.temp is not None or cpu.fan_rpm is not None:
+        lines.append("\n")
+        t_col = _temp_color(cpu.temp)
+        lines.append("  Temp      ", style="bold white")
+        lines.append(f"{_fmt(cpu.temp, '.0f', '°C'):>8}", style=f"bold {t_col}")
+        lines.append("      Fan    ", style="bold white")
+        fan_str = f"{cpu.fan_rpm:.0f} RPM" if cpu.fan_rpm is not None else "---"
+        lines.append(fan_str, style="white")
+        lines.append("\n")
+
+    title = Text()
+    title.append("  CPU  ", style="bold bright_white on blue")
+    title.append(" System ", style="bold bright_cyan")
+
+    return Panel(
+        lines,
+        title=title,
+        title_align="left",
+        border_style="cyan",
+        box=box.ROUNDED,
+        padding=(0, 1),
+    )
+
+
 # ── GPU panel ──────────────────────────────────────────────────────────────────
 
 def build_gpu_panel(g: GPUInfo, bar_width: int) -> Panel:
@@ -547,10 +729,12 @@ def build_footer() -> Panel:
 
 # ── Full renderable ────────────────────────────────────────────────────────────
 
-def build_renderable(gpus, procs, history, stale, poll_interval, bar_width, console_width):
+def build_renderable(gpus, procs, history, cpu, stale, poll_interval, bar_width, console_width):
     parts = [build_header(gpus, stale, poll_interval)]
-    for g in gpus:
+    for i, g in enumerate(gpus):
         parts.append(build_gpu_panel(g, bar_width))
+        if i == 0 and cpu is not None:
+            parts.append(build_cpu_panel(cpu, bar_width))
         gpu_hist = history.get(g.index, [])
         if gpu_hist:
             parts.append(build_history_panel(g, gpu_hist, console_width))
@@ -643,9 +827,9 @@ def main():
                         step = 0.1 if state.poll_interval <= 1.0 else 0.5
                         state.poll_interval = round(max(state.poll_interval - step, 0.1), 1)
 
-                gpus, procs, hist, tick, stale, poll_interval = state.snapshot()
+                gpus, procs, hist, cpu, tick, stale, poll_interval = state.snapshot()
                 live.update(build_renderable(
-                    gpus, procs, hist, stale, poll_interval,
+                    gpus, procs, hist, cpu, stale, poll_interval,
                     args.bar_width, console.width,
                 ))
                 time.sleep(0.05)   # 20 fps key-check; rich auto-refreshes at 8 fps

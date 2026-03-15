@@ -418,21 +418,26 @@ class TestState:
     def test_snapshot_returns_copies(self):
         s = gt.State(1.0)
         s.gpus = [gt.GPUInfo(index=0)]
-        gpus, procs, hist, tick, stale, pi = s.snapshot()
+        gpus, procs, hist, cpu, tick, stale, pi = s.snapshot()
         gpus.append(gt.GPUInfo(index=99))
         assert len(s.gpus) == 1   # original unchanged
 
     def test_snapshot_history_is_copy(self):
         s = gt.State(1.0)
         s.history[0] = deque([gt.HistorySample(util_gpu=50, power_w=100, mem_pct=30, ts=0.0)])
-        _, _, hist, _, _, _ = s.snapshot()
+        _, _, hist, _, _, _, _ = s.snapshot()
         hist[0].append(gt.HistorySample(util_gpu=99, power_w=0, mem_pct=0, ts=0.0))
         assert len(s.history[0]) == 1   # original unchanged
 
     def test_poll_interval_in_snapshot(self):
         s = gt.State(2.5)
-        _, _, _, _, _, pi = s.snapshot()
+        _, _, _, _, _, _, pi = s.snapshot()
         assert pi == pytest.approx(2.5)
+
+    def test_snapshot_cpu_initially_none(self):
+        s = gt.State(1.0)
+        _, _, _, cpu, _, _, _ = s.snapshot()
+        assert cpu is None
 
     def test_snapshot_thread_safe(self):
         """Concurrent reads and writes should not raise."""
@@ -702,7 +707,7 @@ class TestBuildProcPanel:
 
 class TestBuildRenderable:
     def test_empty_gpus_no_crash(self):
-        r = gt.build_renderable([], [], {}, False, 1.0, 30, 120)
+        r = gt.build_renderable([], [], {}, None, False, 1.0, 30, 120)
         assert r is not None
 
     def test_with_history(self):
@@ -711,13 +716,13 @@ class TestBuildRenderable:
             gt.HistorySample(util_gpu=50.0, power_w=100.0, mem_pct=25.0, ts=float(i))
             for i in range(10)
         ]}
-        r = gt.build_renderable([gpu], [], hist, False, 1.0, 30, 120)
+        r = gt.build_renderable([gpu], [], hist, None, False, 1.0, 30, 120)
         assert r is not None
 
     def test_stale_flag_in_header(self):
         from io import StringIO
         from rich.console import Console
-        r = gt.build_renderable([], [], {}, stale=True, poll_interval=1.0, bar_width=20, console_width=100)
+        r = gt.build_renderable([], [], {}, None, stale=True, poll_interval=1.0, bar_width=20, console_width=100)
         buf = StringIO()
         Console(file=buf, width=100).print(r)
         assert "stale" in buf.getvalue()
@@ -727,7 +732,253 @@ class TestBuildRenderable:
         from io import StringIO
         from rich.console import Console
         gpu = gt.GPUInfo(index=0, name="Test GPU")
-        r = gt.build_renderable([gpu], [], {}, False, 1.0, 30, 120)
+        r = gt.build_renderable([gpu], [], {}, None, False, 1.0, 30, 120)
         buf = StringIO()
         Console(file=buf, width=120).print(r)
         assert "History" not in buf.getvalue()
+
+    def test_cpu_panel_shown_for_gpu0(self):
+        from io import StringIO
+        from rich.console import Console
+        gpu = gt.GPUInfo(index=0, name="Test GPU")
+        cpu = gt.CPUInfo(util_pct=42.0, mem_used_mb=8192.0, mem_total_mb=16384.0)
+        r = gt.build_renderable([gpu], [], {}, cpu, False, 1.0, 30, 120)
+        buf = StringIO()
+        Console(file=buf, width=120).print(r)
+        assert "CPU" in buf.getvalue()
+
+    def test_cpu_panel_omitted_when_none(self):
+        from io import StringIO
+        from rich.console import Console
+        gpu = gt.GPUInfo(index=0, name="Test GPU")
+        r = gt.build_renderable([gpu], [], {}, None, False, 1.0, 30, 120)
+        buf = StringIO()
+        Console(file=buf, width=120).print(r)
+        # CPU Util label should not appear when cpu is None
+        assert "CPU Util" not in buf.getvalue()
+
+
+# ── _read_proc_stat ────────────────────────────────────────────────────────────
+
+class TestReadProcStat:
+    def test_returns_list_of_ints(self):
+        result = gt._read_proc_stat()
+        # On Linux this should succeed; on other platforms may return None
+        if result is not None:
+            assert isinstance(result, list)
+            assert all(isinstance(x, int) for x in result)
+            assert len(result) >= 4   # user, nice, system, idle minimum
+
+    def test_bad_file_returns_none(self):
+        with patch("builtins.open", side_effect=OSError("no file")):
+            assert gt._read_proc_stat() is None
+
+    def test_wrong_first_field_returns_none(self):
+        import io
+        fake = "notcpu 100 200 300 400\n"
+        with patch("builtins.open", return_value=io.StringIO(fake)):
+            assert gt._read_proc_stat() is None
+
+    def test_parses_values_correctly(self):
+        import io
+        fake = "cpu 100 200 300 400 50 0 0 0\n"
+        with patch("builtins.open", return_value=io.StringIO(fake)):
+            result = gt._read_proc_stat()
+        assert result == [100, 200, 300, 400, 50, 0, 0, 0]
+
+
+# ── _read_meminfo ──────────────────────────────────────────────────────────────
+
+class TestReadMeminfo:
+    def test_returns_tuple_of_floats_on_linux(self):
+        used, total = gt._read_meminfo()
+        if used is not None:
+            assert used > 0
+            assert total > used
+
+    def test_bad_file_returns_none_none(self):
+        with patch("builtins.open", side_effect=OSError("no file")):
+            used, total = gt._read_meminfo()
+        assert used is None
+        assert total is None
+
+    def test_parses_values_correctly(self):
+        import io
+        fake = "MemTotal:       16384 kB\nMemAvailable:    8192 kB\n"
+        with patch("builtins.open", return_value=io.StringIO(fake)):
+            used, total = gt._read_meminfo()
+        assert used == pytest.approx(8192.0 / 1024)   # 8 MiB used
+        assert total == pytest.approx(16384.0 / 1024)  # 16 MiB total
+
+    def test_missing_keys_returns_none_none(self):
+        import io
+        fake = "SomeOtherKey:    1234 kB\n"
+        with patch("builtins.open", return_value=io.StringIO(fake)):
+            used, total = gt._read_meminfo()
+        assert used is None
+        assert total is None
+
+
+# ── _read_sensors ──────────────────────────────────────────────────────────────
+
+class TestReadSensors:
+    def test_sensors_not_installed_returns_none(self):
+        with patch("gpu_top.subprocess.check_output", side_effect=FileNotFoundError):
+            temp, fan = gt._read_sensors()
+        assert temp is None
+        assert fan is None
+
+    def test_invalid_json_returns_none(self):
+        with patch("gpu_top.subprocess.check_output", return_value="not json"):
+            temp, fan = gt._read_sensors()
+        assert temp is None
+        assert fan is None
+
+    def test_parses_package_temp_and_fan(self):
+        sensors_json = '''{
+            "coretemp-isa-0000": {
+                "Adapter": "ISA adapter",
+                "Package id 0": {
+                    "temp1_input": 55.0,
+                    "temp1_max": 100.0
+                },
+                "fan1": {
+                    "fan1_input": 1200.0
+                }
+            }
+        }'''
+        with patch("gpu_top.subprocess.check_output", return_value=sensors_json):
+            temp, fan = gt._read_sensors()
+        assert temp == pytest.approx(55.0)
+        assert fan == pytest.approx(1200.0)
+
+    def test_falls_back_to_any_temp_when_no_package(self):
+        sensors_json = '''{
+            "some-chip": {
+                "Core 0": {
+                    "temp1_input": 48.0
+                }
+            }
+        }'''
+        with patch("gpu_top.subprocess.check_output", return_value=sensors_json):
+            temp, fan = gt._read_sensors()
+        assert temp == pytest.approx(48.0)
+
+    def test_prefers_package_over_core_temp(self):
+        sensors_json = '''{
+            "coretemp-isa-0000": {
+                "Core 0": {
+                    "temp1_input": 45.0
+                },
+                "Package id 0": {
+                    "temp2_input": 60.0
+                }
+            }
+        }'''
+        with patch("gpu_top.subprocess.check_output", return_value=sensors_json):
+            temp, fan = gt._read_sensors()
+        assert temp == pytest.approx(60.0)
+
+    def test_fan_none_when_absent(self):
+        sensors_json = '{"chip": {"Core 0": {"temp1_input": 50.0}}}'
+        with patch("gpu_top.subprocess.check_output", return_value=sensors_json):
+            _, fan = gt._read_sensors()
+        assert fan is None
+
+
+# ── query_cpu ──────────────────────────────────────────────────────────────────
+
+class TestQueryCpu:
+    def _fake_proc_stat(self, times):
+        import io
+        line = "cpu " + " ".join(str(x) for x in times) + "\n"
+        return io.StringIO(line)
+
+    def test_first_call_util_none(self):
+        with patch("gpu_top._read_proc_stat", return_value=[100, 0, 50, 850, 0, 0, 0, 0]), \
+             patch("gpu_top._read_meminfo", return_value=(4096.0, 16384.0)), \
+             patch("gpu_top._read_sensors", return_value=(55.0, 1200.0)):
+            cpu_info, curr_times = gt.query_cpu(None)
+        assert cpu_info.util_pct is None
+        assert cpu_info.mem_used_mb == pytest.approx(4096.0)
+        assert cpu_info.mem_total_mb == pytest.approx(16384.0)
+        assert cpu_info.temp == pytest.approx(55.0)
+        assert cpu_info.fan_rpm == pytest.approx(1200.0)
+
+    def test_second_call_computes_util(self):
+        # prev: idle=850, total=1000 → next tick adds 100 total, 50 idle → 50% busy
+        prev = [100, 0, 50, 850]
+        curr = [150, 0, 75, 875]  # delta total=100, idle delta=25 → 75% util
+        with patch("gpu_top._read_proc_stat", return_value=curr), \
+             patch("gpu_top._read_meminfo", return_value=(4096.0, 16384.0)), \
+             patch("gpu_top._read_sensors", return_value=(None, None)):
+            cpu_info, _ = gt.query_cpu(prev)
+        assert cpu_info.util_pct == pytest.approx(75.0)
+
+    def test_util_clamped_to_0_100(self):
+        prev = [0, 0, 0, 0]
+        curr = [0, 0, 0, 0]   # zero delta → total=0 → util stays None
+        with patch("gpu_top._read_proc_stat", return_value=curr), \
+             patch("gpu_top._read_meminfo", return_value=(None, None)), \
+             patch("gpu_top._read_sensors", return_value=(None, None)):
+            cpu_info, _ = gt.query_cpu(prev)
+        assert cpu_info.util_pct is None
+
+    def test_returns_curr_times_for_next_call(self):
+        times = [200, 10, 80, 900]
+        with patch("gpu_top._read_proc_stat", return_value=times), \
+             patch("gpu_top._read_meminfo", return_value=(None, None)), \
+             patch("gpu_top._read_sensors", return_value=(None, None)):
+            _, curr_times = gt.query_cpu(None)
+        assert curr_times == times
+
+
+# ── build_cpu_panel ────────────────────────────────────────────────────────────
+
+class TestBuildCpuPanel:
+    def _render(self, cpu):
+        from io import StringIO
+        from rich.console import Console
+        panel = gt.build_cpu_panel(cpu, bar_width=20)
+        buf = StringIO()
+        Console(file=buf, width=120).print(panel)
+        return buf.getvalue()
+
+    def test_renders_without_error(self):
+        cpu = gt.CPUInfo(util_pct=42.0, mem_used_mb=8192.0, mem_total_mb=16384.0)
+        assert gt.build_cpu_panel(cpu, bar_width=20) is not None
+
+    def test_all_none_fields_no_crash(self):
+        cpu = gt.CPUInfo()
+        output = self._render(cpu)
+        assert "---" in output
+
+    def test_util_shown(self):
+        cpu = gt.CPUInfo(util_pct=55.0, mem_used_mb=4096.0, mem_total_mb=8192.0)
+        output = self._render(cpu)
+        assert "55" in output
+
+    def test_memory_gib_shown(self):
+        cpu = gt.CPUInfo(util_pct=10.0, mem_used_mb=8192.0, mem_total_mb=16384.0)
+        output = self._render(cpu)
+        assert "GiB" in output
+
+    def test_temp_and_fan_shown_when_present(self):
+        cpu = gt.CPUInfo(util_pct=10.0, mem_used_mb=4096.0, mem_total_mb=8192.0,
+                         temp=55.0, fan_rpm=1200.0)
+        output = self._render(cpu)
+        assert "55" in output
+        assert "1200" in output
+
+    def test_temp_fan_section_omitted_when_both_none(self):
+        cpu = gt.CPUInfo(util_pct=10.0, mem_used_mb=4096.0, mem_total_mb=8192.0,
+                         temp=None, fan_rpm=None)
+        output = self._render(cpu)
+        assert "Temp" not in output
+        assert "Fan" not in output
+
+    def test_fan_shows_dash_when_none(self):
+        cpu = gt.CPUInfo(util_pct=10.0, mem_used_mb=4096.0, mem_total_mb=8192.0,
+                         temp=60.0, fan_rpm=None)
+        output = self._render(cpu)
+        assert "---" in output
