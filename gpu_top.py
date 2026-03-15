@@ -154,6 +154,8 @@ HISTORY_LEN = 120  # samples retained (2 min at 1 s poll)
 class HistorySample:
     util_gpu: Optional[float]   # 0–100 %
     power_w: Optional[float]    # watts
+    mem_pct: Optional[float]    # 0–100 %
+    ts: float = 0.0             # time.monotonic() at collection
 
 
 class State:
@@ -193,9 +195,17 @@ def _collect_loop(state: State, stop: threading.Event):
                 for g in state.gpus:
                     if g.index not in state.history:
                         state.history[g.index] = deque(maxlen=HISTORY_LEN)
-                    state.history[g.index].append(
-                        HistorySample(util_gpu=g.util_gpu, power_w=g.power_draw)
+                    mem_pct = (
+                        g.mem_used / g.mem_total * 100
+                        if g.mem_used is not None and g.mem_total
+                        else None
                     )
+                    state.history[g.index].append(HistorySample(
+                        util_gpu=g.util_gpu,
+                        power_w=g.power_draw,
+                        mem_pct=mem_pct,
+                        ts=time.monotonic(),
+                    ))
             else:
                 state.stale = True
             state.tick += 1
@@ -338,17 +348,24 @@ def build_history_panel(g: GPUInfo, history: List[HistorySample],
 
     util_vals  = [s.util_gpu for s in history]
     power_vals = [s.power_w  for s in history]
+    mem_vals   = [s.mem_pct  for s in history]
     max_power  = g.power_limit or max((v for v in power_vals if v is not None), default=100.0)
 
     body = Text(no_wrap=True, overflow="ignore")
     _append_graph(body, "GPU Util", util_vals,  100.0,     "bright_green", "%", graph_w)
     body.append("\n")
+    _append_graph(body, "MEM Used", mem_vals,   100.0,     "cyan",         "%", graph_w)
+    body.append("\n")
     _append_graph(body, "Power",    power_vals, max_power, "bright_blue",  "W", graph_w)
 
-    # time-span legend: "  ← Ns ago ───────────────── now →"
-    n = len(history)
-    span_lbl = f"← {n}s ago" if n < 60 else f"← {n//60}m{n%60:02d}s ago"
-    now_lbl  = "now →"
+    # time-span legend using actual elapsed time from sample timestamps
+    span_s = history[-1].ts - history[0].ts if len(history) > 1 else 0.0
+    if span_s < 60:
+        span_lbl = f"← {span_s:.0f}s ago"
+    else:
+        m, s = divmod(int(span_s), 60)
+        span_lbl = f"← {m}m{s:02d}s ago"
+    now_lbl    = "now →"
     mid_dashes = max(0, graph_w - len(span_lbl) - len(now_lbl) - 2)
     body.append(f"\n  {span_lbl} ", style="dim")
     body.append("─" * mid_dashes, style="dim")
@@ -544,7 +561,7 @@ def main():
         print("Error: nvidia-smi not found in PATH.", file=sys.stderr)
         sys.exit(1)
 
-    state = State(poll_interval=max(0.5, args.delay))
+    state = State(poll_interval=max(0.1, args.delay))
     stop = threading.Event()
     collector = threading.Thread(target=_collect_loop, args=(state, stop), daemon=True)
     collector.start()
@@ -579,10 +596,12 @@ def main():
                     break
                 elif key == "+":
                     with state.lock:
-                        state.poll_interval = min(state.poll_interval + 0.5, 10.0)
+                        step = 0.1 if state.poll_interval < 1.0 else 0.5
+                        state.poll_interval = round(min(state.poll_interval + step, 10.0), 1)
                 elif key == "-":
                     with state.lock:
-                        state.poll_interval = max(state.poll_interval - 0.5, 0.5)
+                        step = 0.1 if state.poll_interval <= 1.0 else 0.5
+                        state.poll_interval = round(max(state.poll_interval - step, 0.1), 1)
 
                 gpus, procs, hist, tick, stale, poll_interval = state.snapshot()
                 live.update(build_renderable(
