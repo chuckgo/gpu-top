@@ -1,8 +1,8 @@
 # gpu-top
 
-A terminal GPU monitor for NVIDIA GPUs, inspired by nvtop. Parses `nvidia-smi`
-output and renders a live full-screen dashboard with smooth progress bars,
-rolling history sparklines, and a process table.
+A terminal monitor for NVIDIA GPUs and system CPU, inspired by nvtop. Parses
+`nvidia-smi` output and `/proc` for a live full-screen dashboard with smooth
+progress bars, rolling history sparklines, and a process table.
 
 ![gpu-top screenshot](screenshot.svg)
 
@@ -56,6 +56,11 @@ python gpu_top.py [--delay SEC] [--bar-width N]
 **GPU panel** — per-GPU utilization bar, memory bar (used / total MiB),
 temperature, power draw vs. limit, fan speed, core and memory clock.
 
+**CPU panel** — overall CPU utilization bar, system memory bar (used / total
+GiB), and — when `lm-sensors` is installed — package temperature and highest
+fan RPM. The panel appears between GPU 0 metrics and its history graphs.
+Temperature and fan are silently omitted if unavailable (e.g. WSL2).
+
 **History panel** — three 4-row block-character sparklines covering the last
 120 samples: GPU utilization %, memory usage %, and power draw (W). The
 time-span label tracks actual elapsed wall time, so it stays accurate when
@@ -69,12 +74,12 @@ visibility) show as `N/A` without crashing.
 
 Everything lives in a single file (`gpu_top.py`).
 
-A daemon thread polls `nvidia-smi` every `--delay` seconds, running two
-parallel subprocesses (GPU metrics and compute-app list) and writing results
-under a `threading.Lock`. The main thread reads a snapshot at up to 20 fps
-and hands it to `rich.live.Live` which diffs and redraws only changed cells.
-CPU overhead is negligible — two ~40 ms subprocess calls per second, with the
-Python process otherwise idle.
+A daemon thread polls every `--delay` seconds, running three parallel
+collectors: GPU metrics (`nvidia-smi`), compute-app list (`nvidia-smi`), and
+CPU metrics (`/proc/stat`, `/proc/meminfo`, `sensors -j`). Results are written
+under a `threading.Lock`. The main thread reads a snapshot at up to 20 fps and
+hands it to `rich.live.Live` which diffs and redraws only changed cells. CPU
+overhead is negligible — the Python process is otherwise idle between polls.
 
 ## Development
 
@@ -84,7 +89,7 @@ pip install -r requirements-dev.txt   # adds pytest, pytest-mock, ruff
 # Lint
 ruff check gpu_top.py tests/
 
-# Tests (106 cases, no GPU required — nvidia-smi is fully mocked)
+# Tests (134 cases, no GPU required — nvidia-smi is fully mocked)
 pytest tests/ -v
 ```
 
